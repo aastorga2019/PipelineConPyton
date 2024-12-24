@@ -1,0 +1,147 @@
+import groovy.json.JsonSlurperClassic
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.text.SimpleDateFormat
+
+def insertDataBigQuery(PROJECT, DATASET, TABLE, DATA_JSON) {
+  retry(2){
+    try{
+      sh (script:
+      """
+      curl --location 'https://us-central1-latamxp-infrastructure.cloudfunctions.net/ebiz-bigquery-api' \
+      --header 'Content-Type: application/json' \
+      --data '{
+        "operation": "insert_rows",
+        "config": {
+            "project": "${PROJECT}",
+            "dataset": "${DATASET}",
+            "table": "${TABLE}"
+        },
+        "rows": [
+            ${DATA_JSON}
+          ]
+      }'
+      """)
+    }catch(Exception e){
+      sleep(5)
+      error(e.getMessage())
+    }
+  }
+}
+
+def writePipelineDataToBigQuery(PIPELINE_CUSTOM_DATA) {
+  def pipelineDataRequestJson = JsonOutput.toJson(PIPELINE_CUSTOM_DATA)
+  insertDataBigQuery("latamxp-infrastructure", "EBIZ_DELIVERY", "gitlab_metrics", pipelineDataRequestJson)
+}
+
+def writePipelineBitbucketDataToBigQuery(BITBUCKET_DATA_BY_PROJECT) {
+  def pipelineDataRequestJson = JsonOutput.toJson(BITBUCKET_DATA_BY_PROJECT)
+  insertDataBigQuery("latamxp-infrastructure", "EBIZ_DELIVERY", "bitbucket_metrics", pipelineDataRequestJson)
+}
+
+pipeline {
+  environment {
+    SLACK_BOT_TOKEN = credentials('SLACK_BOT_TOKEN')
+    JENKINS_SLACK_CREDENTIALS = credentials('JENKINS_SLACK_CREDENTIALS')
+    SLACK_CHANNEL = "#migracion_gitlab"
+    SLACK_CHANNEL_ERROR = "#hudson_alerts"
+    REPO_MANIFESTS = 'git@gitlab.com:latamairlines/paxc/ebz/delivery/gitlab-migration-metrics-pipeline.git'
+    CLOUD_FUNCTION_BIGQUERY_API_URL = 'https://us-central1-latamxp-infrastructure.cloudfunctions.net/ebiz-bigquery-api'
+    gitlabData = ""
+  }
+  agent {
+    kubernetes {
+      label 'latamxp-build-front-stable'
+      yamlFile 'ci/AgentPod.yaml'
+    }
+  }
+  triggers {
+    cron(env.BRANCH_NAME == 'master' ? 'TZ=America/Santiago\n 0 7 * * 1-5' : '')
+  }
+  stages {
+    stage('Setup Time variables'){
+      steps{
+        script{
+          gitlabData = [:]
+          total_repository_by_project = [:]
+          def now = new Date()
+          def dateTimePattern = "dd-MM-yyyy"
+          def dateTimeFormat = now.format(dateTimePattern, TimeZone.getTimeZone('America/Santiago'))
+          def timePattern = "HH:mm:ss"
+          def timeZone = TimeZone.getTimeZone('America/Santiago')
+          def timeFormat = now.format(timePattern, timeZone)
+          gitlabData["date"] = dateTimeFormat
+          gitlabData["hour"] = timeFormat
+        }
+      }
+    }
+    stage('Checkout Code') {
+      options { timeout(time: 10, unit: 'MINUTES') }
+      steps {
+        retry(3){
+          script {
+            withCredentials([sshUserPrivateKey(credentialsId: 'jenkins-bitbucket' , keyFileVariable: 'JENBITKEY')]) {
+            sh """
+              #!/usr/bin/env bash
+              export GIT_SSH_COMMAND="ssh -oStrictHostKeyChecking=no -i $JENBITKEY"
+              git config --global user.email "cloudops.globant@latam.com"
+              git config --global user.name "Cloudbees Pipeline"
+              rm -rf ${WORKSPACE}/* 
+              rm -rf ${WORKSPACE}/.??*
+              git clone ${REPO_MANIFESTS} ${WORKSPACE}/.
+              git checkout $GIT_BRANCH
+              git submodule update --init
+              """
+            }
+          }
+        }
+      }
+    } 
+    stage('Run Gitlab Metrics Application') {
+      steps {
+        container('tool-rosie') {
+          script {
+            sh 'python -m pip install -r requirements.txt'
+            withCredentials([usernamePassword(credentialsId: 'CLOUDBEES_BITBUCKET_INFRA' , usernameVariable: 'JENKINS_CREDENTIALS_USR', passwordVariable: 'JENKINS_CREDENTIALS_PSW')]) {
+              retry(2){
+                def responseString = sh(script: """
+                python src/gitlabMigrationData.py ${env.JENKINS_CREDENTIALS_USR} ${env.JENKINS_CREDENTIALS_PSW}
+                """, returnStdout: true)
+                def response = new groovy.json.JsonSlurperClassic().parseText(responseString)
+
+                gitlabData["total_repos"] = response['total_repositories']
+                gitlabData["total_migrated"] = response['total_archived_repositories_with_gitlab_label']
+                total_repository_by_project = response['total_repository_by_project']
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    success {
+      script {
+        def progressPercetage = String.format("%.2f%%", ((gitlabData['total_migrated'].toInteger() / gitlabData['total_repos'].toInteger()) * 100))
+        slackSend channel: "${SLACK_CHANNEL}", color: 'good',
+        message: ":gitlab: *Datos Migración de Gitlab* :mega::clipboard:\n*Fecha*: ${gitlabData['date']} - *Hora*: ${gitlabData['hour']}\n*Total de Repositorios*: ${gitlabData['total_repos']} - *Total Migrados*: ${gitlabData['total_migrated']}\n*Porcentaje de avance en la migración*: ${progressPercetage}"
+        writePipelineDataToBigQuery(gitlabData)
+        total_repository_by_project.each { project, repository_data ->
+          def bitbucketOutputDataByProject = [:]
+          bitbucketOutputDataByProject["date"] = gitlabData["date"]
+          bitbucketOutputDataByProject["hour"] = gitlabData["hour"]
+          bitbucketOutputDataByProject["project_id"] = project
+          bitbucketOutputDataByProject["total_repository"] = repository_data["total_repository"]
+          bitbucketOutputDataByProject["total_repository_migrated"] = repository_data["total_repository_migrated"]
+          writePipelineBitbucketDataToBigQuery(bitbucketOutputDataByProject)
+        }
+      }
+    }
+    failure {
+      script {
+        slackSend channel: "${SLACK_CHANNEL_ERROR}", color: '#FF0000',
+        message: ":alerts: *${currentBuild.currentResult}:* :alerts:\n:gitlab: *Gitlab Migration Metrics Pipeline*\n_Build:_ *${env.BUILD_NUMBER}*\n _More info at:_\n ${env.BUILD_URL}"
+      }
+    }
+  }
+}
